@@ -1,30 +1,30 @@
 use framework "Foundation"
-use framework "Quartz"
 use scripting additions
+
 -- =====================================================
 -- Drafts: Mail → Call Sheet (MacOS)
 -- =====================================================
 -- Notes for Drafts AppleScript actions (macOS):
---  • Drafts calls `on execute(d)` automatically. The passed `d` is a read-only
---    record, not a live draft; new drafts are created via `tell application "Drafts"`.
---  • Networking uses NSURLConnection sendSynchronousRequest (works inside Drafts'
---    host; NSURLSession's script-object delegate does not fire reliably there).
---  • Messages are read once into records, then deduped and sorted with no Mail calls.
---  • PDF attachments are extracted to text via PDFKit (text layer only, no OCR) and
---    folded into each message body before the thread is sent to the model.
---  • Message links are built deterministically (Markdown-safe) and appended after the
---    model returns, never sent through the model (which would corrupt the Message-IDs).
+--  • Drafts calls `on execute(d)` automatically. Do NOT call execute() at top level.
+--  • Always return only primitive values (e.g., text) to avoid serialization issues.
+--  • Avoid long UI interactions; Drafts may time out waiting on other apps.
+--  • Uses NSURLConnection instead of curl to avoid sandbox DNS issues.
+--  • Uses Gemini system_instruction for role/constraints (best practice for Gemini 3).
+--  • Single API call combines reconstruction + extraction for lower latency.
 -- =====================================================
+
 -- *** USER SETTINGS ***
 property geminiAPIKeyName : "Gemini_API_Key" -- Keychain service name for the Gemini API key
 property geminiModel : "gemini-3.1-pro-preview" -- Primary model
 property draftsTags : {"callsheet"}
 property maxMessagesPerThread : 50 -- Cap to limit token/latency
-property maxPDFCharsPerAttachment : 20000 -- Cap extracted PDF text per attachment
 property showAlerts : true -- Set false to suppress display alerts when running from Drafts
 property requestTimeoutSecs : 180 -- Max seconds per Gemini API call
+
 -- System instruction: defines the model's role and output constraints.
+-- Placed in system_instruction (not user content) per Gemini 3 best practices.
 property systemInstruction : "You are a production assistant for photographer David Degner. You process raw email threads into structured call sheets.
+
 <rules>
 - Extract ONLY facts explicitly stated in the email thread. Never infer or fabricate details.
 - Omit conversational pleasantries, sign-offs, and email signatures.
@@ -32,44 +32,69 @@ property systemInstruction : "You are a production assistant for photographer Da
 - Do not wrap your output in code fences (no ```markdown or ``` delimiters).
 - If a section has no relevant information in the thread, include only the heading with no content below it.
 </rules>
+
 <output_format>
 Your response must contain exactly two sections separated by a line of 36 dashes (------------------------------------).
+
 The first line must be: # YYYYMMDD - {project-title}
 If the shoot date is unknown, use XXXXXXXXX in place of YYYYMMDD.
 Then include these markdown headings in order, each as ###:
+
 ### LOCATION
 The photography location or client address and start time.
+
 ### PROJECT DESCRIPTION
 Key objectives, scope, style, goals, or focus areas.  If a NYTimes assignment include the Assignment ID here.
+
 ### TEAM AND ROLES
 All mentioned team members, subjects, and their roles.
+
 ### CLIENT INFORMATION
 Client/company name, main contact (and role if mentioned), contact details (email, phone) without labels. Include agency name and contact if involved.
+
 ### PROJECT TIMELINE
 Labeled relevant dates: deadlines, shoot dates, delivery timelines.
+
 ### DELIVERABLES
 Required outputs (photos, videos) with quantity, format, and settings.
+
 ### BUDGET
 All mentions of budgets, costs, fees, pricing, estimates, quotes, rates, and monetary values.
+
 After the separator line, present the emails in correct chronological order with redundant quoted text and signatures removed.
 Format each message as:
 **From:** Sender Name, Date, Time
 Message content
 ---
 </output_format>"
+
 -- User prompt template: context-first, task-last (per Gemini best practices for long context)
 property userPromptIntro : "Process the following raw email thread into a call sheet and reconstructed thread per your instructions.
+
 <email_thread>"
+
 property userPromptOutro : "</email_thread>
+
 Produce the call sheet followed by the separator line and reconstructed thread now."
+
 -- =============================
 -- Utility helpers
 -- =============================
+
+on urlEncode(theText)
+	set nsText to current application's NSString's stringWithString:theText
+	-- Allow only unreserved URI characters; encode everything else
+	set allowedChars to current application's NSCharacterSet's characterSetWithCharactersInString:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+	set encoded to nsText's stringByAddingPercentEncodingWithAllowedCharacters:allowedChars
+	return encoded as text
+end urlEncode
+
 on showAlert(t, m)
 	if showAlerts then
 		display alert t message m buttons {"OK"} default button "OK"
 	end if
 end showAlert
+
 on replace_chars(theText, searchString, replacementString)
 	set AppleScript's text item delimiters to searchString
 	set theItems to text items of theText
@@ -78,15 +103,18 @@ on replace_chars(theText, searchString, replacementString)
 	set AppleScript's text item delimiters to ""
 	return theText
 end replace_chars
+
 on trim(someText)
 	set nsText to current application's NSString's stringWithString:someText
 	set trimmedText to nsText's stringByTrimmingCharactersInSet:(current application's NSCharacterSet's whitespaceAndNewlineCharacterSet())
 	return trimmedText as string
 end trim
+
 on lowerText(someText)
 	set nsText to current application's NSString's stringWithString:(someText as text)
 	return (nsText's lowercaseString()) as text
 end lowerText
+
 on stripCodeFences(someText)
 	-- Strip leading ```markdown or ``` and trailing ```
 	set t to my trim(someText)
@@ -102,8 +130,10 @@ on stripCodeFences(someText)
 	end if
 	return my trim(t)
 end stripCodeFences
+
 on normalizeSubject(s)
 	set t to my trim(s as text)
+
 	-- Strip leading bracket tags like [EXTERNAL], [EXT], [SECURE], etc. (repeatable)
 	repeat while (t begins with "[")
 		set closePos to offset of "]" in t
@@ -117,6 +147,7 @@ on normalizeSubject(s)
 			exit repeat
 		end if
 	end repeat
+
 	-- Strip repeated prefixes (case-insensitive), allowing optional space after colon
 	repeat
 		set lc to my lowerText(t)
@@ -130,8 +161,20 @@ on normalizeSubject(s)
 			exit repeat
 		end if
 	end repeat
+
 	return my trim(t)
 end normalizeSubject
+
+on createMessageLink(theMessage)
+	tell application "Mail"
+		set messageId to message id of theMessage
+		set messageSubject to subject of theMessage
+	end tell
+	set messageLink to "message://%3c" & messageId & "%3e"
+	set markdownLink to "[" & messageSubject & "](" & messageLink & ")"
+	return markdownLink
+end createMessageLink
+
 on getAPIKeyFromKeychain(keyName)
 	try
 		set apiKey to do shell script "security find-generic-password -w -s " & quoted form of keyName
@@ -140,123 +183,51 @@ on getAPIKeyFromKeychain(keyName)
 		return missing value
 	end try
 end getAPIKeyFromKeychain
--- Make a sender/date string safe to use as Markdown link text
-on sanitizeLinkLabel(someText)
-	set t to my replace_chars(someText, "[", "(")
-	set t to my replace_chars(t, "]", ")")
-	set t to my replace_chars(t, "<", "")
-	set t to my replace_chars(t, ">", "")
-	return t
-end sanitizeLinkLabel
--- Build a Markdown-safe message:// URL from a raw Message-ID
-on messageURL(mid)
-	set nsID to current application's NSString's stringWithString:(mid as text)
-	set allowedChars to current application's NSCharacterSet's characterSetWithCharactersInString:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~@"
-	set encID to (nsID's stringByAddingPercentEncodingWithAllowedCharacters:allowedChars) as text
-	return "message://%3c" & encID & "%3e"
-end messageURL
--- =============================
--- PDF attachment extraction (PDFKit text layer; no OCR)
--- =============================
-on pdfFileToText(posixPath)
-	set theURL to current application's NSURL's fileURLWithPath:posixPath
-	set pdfDoc to current application's PDFDocument's alloc()'s initWithURL:theURL
-	if pdfDoc is missing value then return "" -- unreadable or encrypted
-	set theString to pdfDoc's |string|()
-	if theString is missing value then return "" -- no embedded text layer (scanned image)
-	return (theString as text)
-end pdfFileToText
-on extractPDFText(theMessage)
-	set collectedText to ""
+
+on sortMessagesByDate(messageList)
+	set sortedMessages to messageList
+	set messageCount to count of sortedMessages
 	tell application "Mail"
-		set atts to mail attachments of theMessage
+		repeat with i from 1 to (messageCount - 1)
+			repeat with j from (i + 1) to messageCount
+				set messageI to item i of sortedMessages
+				set messageJ to item j of sortedMessages
+				set dateI to date received of messageI
+				set dateJ to date received of messageJ
+				if dateI > dateJ then
+					set item i of sortedMessages to messageJ
+					set item j of sortedMessages to messageI
+				end if
+			end repeat
+		end repeat
 	end tell
-	repeat with a in atts
-		tell application "Mail"
-			set aName to (name of a)
-			set isDown to (downloaded of a)
-			set aMime to ""
-			try
-				set aMime to (MIME type of a)
-			end try
-		end tell
-		set isPDF to (aMime is "application/pdf") or (aName ends with ".pdf") or (aName ends with ".PDF")
-		if isPDF then
-			try
-				if not isDown then error "attachment not downloaded"
-				set tmpPath to (POSIX path of (path to temporary items)) & "callsheet_" & (do shell script "uuidgen") & ".pdf"
-				tell application "Mail"
-					save a in (POSIX file tmpPath)
-				end tell
-				set t to my pdfFileToText(tmpPath)
-				do shell script "rm -f " & quoted form of tmpPath
-				set t to my trim(t)
-				if (count of t) > maxPDFCharsPerAttachment then
-					set t to (text 1 thru maxPDFCharsPerAttachment of t) & linefeed & "[...PDF text truncated...]"
-				end if
-				if t is not "" then
-					set collectedText to collectedText & "----- PDF ATTACHMENT: " & aName & " -----" & linefeed & t & linefeed & linefeed
-				end if
-			on error
-				-- not downloaded, encrypted, or unreadable: skip silently
-			end try
-		end if
-	end repeat
-	return collectedText
-end extractPDFText
--- =============================
--- Read messages once, dedupe by Message-ID in the same pass.
--- Returns a list of records; no further Mail calls are needed after this.
--- =============================
-on collectMessageData(messageList)
-	set recordList to {}
+	return sortedMessages
+end sortMessagesByDate
+
+on dedupeByMessageID(messageList)
+	set resultList to {}
 	set seenIDs to {}
 	tell application "Mail"
 		repeat with m in messageList
 			set mid to message id of m
 			if seenIDs does not contain mid then
 				set end of seenIDs to mid
-				set theSender to sender of m
-				set theSubject to subject of m
-				set theDate to date received of m
-				set theBody to content of m
-				set pdfText to my extractPDFText(m)
-				if pdfText is not "" then set theBody to theBody & linefeed & linefeed & pdfText
-				set end of recordList to {msgID:mid, dateVal:theDate, theSender:theSender, theSubject:theSubject, theBody:theBody}
+				set end of resultList to m
 			end if
 		end repeat
 	end tell
-	return recordList
-end collectMessageData
--- Insertion sort, ascending by date. Pure AppleScript, no Apple events.
--- Uses an explicit nested test (not `and`) so item j is never read when j < 1.
-on sortRecordsByDate(recordList)
-	set n to count of recordList
-	if n < 2 then return recordList
-	repeat with i from 2 to n
-		set curRec to item i of recordList
-		set curDate to dateVal of curRec
-		set j to i - 1
-		set placed to false
-		repeat while j ≥ 1 and (not placed)
-			if (dateVal of (item j of recordList)) > curDate then
-				set item (j + 1) of recordList to item j of recordList
-				set j to j - 1
-			else
-				set placed to true
-			end if
-		end repeat
-		set item (j + 1) of recordList to curRec
-	end repeat
-	return recordList
-end sortRecordsByDate
+	return resultList
+end dedupeByMessageID
+
 -- =============================
--- Gemini call via NSURLConnection (synchronous, sandbox-safe, no curl dependency)
+-- Gemini call via NSURLConnection (sandbox-safe, no curl dependency)
 -- =============================
+
 on callGeminiAPI(apiKey, sysInstruction, promptText, modelName)
 	-- Build request JSON with Cocoa (safe escaping)
 	set dict to current application's NSMutableDictionary's dictionary()
-	-- System instruction (separate from user content)
+
+	-- System instruction (Gemini 3 best practice: separate from user content)
 	set sysPartsArr to current application's NSMutableArray's array()
 	set sysPartDict to current application's NSMutableDictionary's dictionary()
 	sysPartDict's setObject:sysInstruction forKey:"text"
@@ -264,23 +235,29 @@ on callGeminiAPI(apiKey, sysInstruction, promptText, modelName)
 	set sysDict to current application's NSMutableDictionary's dictionary()
 	sysDict's setObject:sysPartsArr forKey:"parts"
 	dict's setObject:sysDict forKey:"system_instruction"
+
 	-- User content
 	set contentsArr to current application's NSMutableArray's array()
 	set partsArr to current application's NSMutableArray's array()
 	set partDict to current application's NSMutableDictionary's dictionary()
 	partDict's setObject:promptText forKey:"text"
 	partsArr's addObject:partDict
+
 	set contentDict to current application's NSMutableDictionary's dictionary()
 	contentDict's setObject:"user" forKey:"role"
 	contentDict's setObject:partsArr forKey:"parts"
 	contentsArr's addObject:contentDict
+
 	dict's setObject:contentsArr forKey:"contents"
-	-- Generation config
+
+	-- Generation config: temperature 1.0 is strongly recommended for Gemini 3
 	set genCfg to current application's NSMutableDictionary's dictionary()
 	genCfg's setObject:(current application's NSNumber's numberWithDouble:1.0) forKey:"temperature"
 	genCfg's setObject:(current application's NSNumber's numberWithInteger:16384) forKey:"maxOutputTokens"
 	dict's setObject:genCfg forKey:"generationConfig"
+
 	set jsonData to current application's NSJSONSerialization's dataWithJSONObject:dict options:0 |error|:(missing value)
+
 	-- Build NSURLRequest
 	set endpointStr to "https://generativelanguage.googleapis.com/v1beta/models/" & modelName & ":generateContent"
 	set reqURL to current application's NSURL's URLWithString:endpointStr
@@ -290,24 +267,31 @@ on callGeminiAPI(apiKey, sysInstruction, promptText, modelName)
 	urlRequest's setValue:"application/json" forHTTPHeaderField:"Content-Type"
 	urlRequest's setValue:apiKey forHTTPHeaderField:"x-goog-api-key"
 	urlRequest's setTimeoutInterval:requestTimeoutSecs
-	-- Synchronous send via NSURLConnection (native macOS networking, works inside Drafts' host)
+
+	-- Synchronous send via NSURLConnection (uses macOS native networking, sandbox-safe)
+	-- sendSynchronousRequest returns {NSData, NSURLResponse, NSError} in AppleScript-ObjC
 	set {respData, urlResponse, respError} to current application's NSURLConnection's sendSynchronousRequest:urlRequest returningResponse:(reference) |error|:(reference)
+
 	if respError is not missing value then
 		set errDesc to (respError's localizedDescription()) as text
 		my showAlert("Network Error", "Failed to reach Gemini API:" & linefeed & errDesc)
 		return {success:false, body:""}
 	end if
+
 	if respData is missing value then
 		my showAlert("Network Error", "Gemini API returned no data.")
 		return {success:false, body:""}
 	end if
+
 	-- Parse response JSON
 	set respObj to current application's NSJSONSerialization's JSONObjectWithData:respData options:0 |error|:(missing value)
+
 	if respObj is missing value then
 		set rawResp to (current application's NSString's alloc()'s initWithData:respData encoding:(current application's NSUTF8StringEncoding)) as text
 		my showAlert("Gemini Error", "Could not parse API response as JSON." & linefeed & linefeed & "Raw response:" & linefeed & rawResp)
 		return {success:false, body:""}
 	end if
+
 	-- Check for API-level error object
 	set errObj to respObj's objectForKey:"error"
 	if errObj is not missing value then
@@ -315,13 +299,16 @@ on callGeminiAPI(apiKey, sysInstruction, promptText, modelName)
 		my showAlert("Gemini API Error", errMessage)
 		return {success:false, body:""}
 	end if
+
 	set candidates to respObj's objectForKey:"candidates"
 	if (candidates = missing value) or ((candidates's |count|()) = 0) then
 		set rawResp to (current application's NSString's alloc()'s initWithData:respData encoding:(current application's NSUTF8StringEncoding)) as text
 		my showAlert("Gemini Error", "Gemini returned no candidates." & linefeed & linefeed & "Response:" & linefeed & rawResp)
 		return {success:false, body:""}
 	end if
+
 	set firstCand to candidates's objectAtIndex:0
+
 	-- Check for content-filtering block (finishReason != "STOP")
 	set finishReason to firstCand's objectForKey:"finishReason"
 	if finishReason is not missing value then
@@ -331,36 +318,45 @@ on callGeminiAPI(apiKey, sysInstruction, promptText, modelName)
 			return {success:false, body:""}
 		end if
 	end if
+
 	set contentDict2 to firstCand's objectForKey:"content"
 	if contentDict2 is missing value then
 		my showAlert("Gemini Error", "Gemini candidate has no content object.")
 		return {success:false, body:""}
 	end if
+
 	set partsArray2 to contentDict2's objectForKey:"parts"
 	if (partsArray2 is missing value) or ((partsArray2's |count|()) = 0) then
 		my showAlert("Gemini Error", "Gemini returned no text parts.")
 		return {success:false, body:""}
 	end if
+
 	set outText to ""
 	repeat with i from 0 to ((partsArray2's |count|()) - 1)
 		set p to (partsArray2's objectAtIndex:i)
 		set t to p's objectForKey:"text"
 		if t is not missing value then set outText to outText & (t as text)
 	end repeat
+
 	-- Guard against valid JSON but empty actual text
 	if (my trim(outText)) is "" then
 		my showAlert("Gemini Error", "Gemini returned parts but no text content." & linefeed & linefeed & "This may indicate the model filtered the response or changed its output format.")
 		return {success:false, body:""}
 	end if
+
 	return {success:true, body:outText}
 end callGeminiAPI
+
 -- =============================
 -- Drafts Action Entry Point
 -- =============================
+
 on execute(d)
 	try
+		set threadContent to ""
 		set allRelated to {}
 		set sel to {}
+
 		with timeout of 600 seconds
 			tell application "Mail"
 				if not (exists message viewer 1) then
@@ -372,7 +368,8 @@ on execute(d)
 					my showAlert("No email selected", "Please select an email (or multiple emails) in the viewer.")
 					return ""
 				end if
-				-- Collect related messages for each selection (subject-normalized)
+
+				-- Collect related messages for each selection (subject-normalized), then dedupe by Message-ID
 				repeat with baseMsg in sel
 					set subjRaw to subject of baseMsg
 					set subjCore to my normalizeSubject(subjRaw)
@@ -383,56 +380,66 @@ on execute(d)
 				end repeat
 			end tell
 		end timeout
-		-- Read each message once (deduped, with PDF text), then sort with no further Mail calls
-		set msgRecords to my collectMessageData(allRelated)
-		set msgRecords to my sortRecordsByDate(msgRecords)
+
+		set allRelated to my dedupeByMessageID(allRelated)
+		set allRelated to my sortMessagesByDate(allRelated)
+
 		-- Cap to the most recent N to keep prompts manageable
-		set totalCount to (count of msgRecords)
+		set totalCount to (count of allRelated)
 		if totalCount > maxMessagesPerThread then
 			set startIndex to (totalCount - maxMessagesPerThread + 1)
-			set msgRecords to items startIndex thru totalCount of msgRecords
+			set allRelated to items startIndex thru totalCount of allRelated
 		end if
-		-- Build the LLM thread and a deterministic, Markdown-safe source-link list, in one pass.
-		set threadContent to ""
-		set sourceLinks to ""
-		set recCount to (count of msgRecords)
-		repeat with k from 1 to recCount
-			set rec to item k of msgRecords
-			set theDate to dateVal of rec
-			set ds to (date string of theDate)
-			set ts to (time string of theDate)
-			set threadContent to threadContent & "From: " & (theSender of rec) & " / Subject: " & (theSubject of rec) & " / Date: " & ds & " " & ts & linefeed & (theBody of rec) & linefeed & linefeed & "---" & linefeed & linefeed
-			set lbl to my sanitizeLinkLabel((theSender of rec) & ", " & ds & " " & ts)
-			set sourceLinks to sourceLinks & "- [" & lbl & "](" & my messageURL(msgID of rec) & ")" & linefeed
-		end repeat
+
+		-- Build plain text thread content for the LLM (chronological)
+		tell application "Mail"
+			repeat with eachMessage in allRelated
+				set emailSender to sender of eachMessage
+				set emailSubject to subject of eachMessage
+				set emailDate to date received of eachMessage
+				set emailBody to content of eachMessage
+				set ds to (date string of emailDate)
+				set ts to (time string of emailDate)
+				set messageLink to my createMessageLink(eachMessage)
+				set threadContent to threadContent & "From: " & emailSender & " / Subject: " & emailSubject & " / Date: " & ds & " " & ts & linefeed & emailBody & linefeed & linefeed & "Message Link: " & messageLink & linefeed & "---" & linefeed & linefeed
+			end repeat
+		end tell
+
 		-- Validate we actually got email content
 		if (my trim(threadContent)) is "" then
 			my showAlert("Empty Thread", "No email content could be extracted from the selected messages.")
 			return ""
 		end if
+
 		-- Build the user prompt: context first, instruction last
 		set fullPrompt to userPromptIntro & linefeed & threadContent & linefeed & userPromptOutro
+
 		set geminiAPIKey to my getAPIKeyFromKeychain(geminiAPIKeyName)
 		if geminiAPIKey is missing value then
 			my showAlert("API Key Not Found", "Store your Gemini API Key in Keychain with the service name '" & geminiAPIKeyName & "'.")
 			return ""
 		end if
-		-- Single API call
+
+		-- Single API call: system instruction handles role/format, user content has the thread
 		set apiResult to my callGeminiAPI(geminiAPIKey, systemInstruction, fullPrompt, geminiModel)
 		if success of apiResult is false then return ""
 		set rawOutput to body of apiResult
-		-- Strip code fences if the model wrapped its output, normalize line endings
+
+		-- Strip code fences if the model wrapped its output
 		set cleanOutput to my stripCodeFences(rawOutput)
+
+		-- Normalize line endings
 		set fullContent to my replace_chars(cleanOutput, return, linefeed)
-		-- Append the deterministic source links (never routed through the model)
-		if (my trim(sourceLinks)) is not "" then
-			set fullContent to fullContent & linefeed & linefeed & "### SOURCE MESSAGES" & linefeed & linefeed & sourceLinks
-		end if
-		-- Create the draft directly via Drafts' AppleScript dictionary (no URL-length limit)
-		tell application "Drafts"
-			make new draft with properties {content:fullContent, flagged:false, tag list:draftsTags}
-		end tell
+
+		-- Create the Draft via URL scheme (reliable across Drafts versions)
+		set encodedContent to my urlEncode(fullContent)
+		set draftURL to "drafts://x-callback-url/create?text=" & encodedContent
+		repeat with t in draftsTags
+			set draftURL to draftURL & "&tag=" & my urlEncode(t)
+		end repeat
+		open location draftURL
 		return ""
+
 	on error errMsg number errNum
 		my showAlert("Error", ("An error occurred: " & errMsg & " (" & errNum & ")"))
 		return ""

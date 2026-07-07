@@ -1,4 +1,4 @@
-const PRIMARY_MODEL = "models/gemini-3-flash-preview";
+const PRIMARY_MODEL = "models/gemini-3.1-flash-lite";
 
 function extractJson(text) {
   if (!text) return "";
@@ -29,11 +29,8 @@ function toCamelCaseWords(input) {
 
 function sanitizeKeyword(k) {
   let s = String(k || "").trim();
-  // Prevent accidental Photo Mechanic tag injection
   s = s.replace(/[{}]/g, "");
-  // Remove leading hashtags
   s = s.replace(/^#+/, "");
-  // Collapse whitespace and trim trailing punctuation
   s = s.replace(/\s+/g, " ").replace(/[.,;:]+$/g, "").trim();
   return s;
 }
@@ -45,7 +42,6 @@ function normalizeKeywords(val) {
   } else if (typeof val === "string") {
     arr = val.split(/[,;\n|]+/);
   }
-
   const seen = {};
   const out = [];
   for (let item of arr) {
@@ -62,13 +58,11 @@ function normalizeKeywords(val) {
 
 let f = () => {
   const draftContent = draft.content;
-
   if (!draftContent || draftContent.trim().length === 0) {
-    app.displayAlert("Empty Draft", "There is no text to process.");
+    alert("Empty Draft\n\nThere is no text to process.");
     return false;
   }
 
-  // Save current draft state (does not change content)
   draft.update();
 
   const systemInstruction =
@@ -92,7 +86,7 @@ let f = () => {
     raw = ai.quickPrompt(combinedPrompt, PRIMARY_MODEL);
     if (!raw || raw.trim().length === 0) throw new Error("Empty response received.");
   } catch (error) {
-    app.displayAlert("AI Error", "Gemini failed: " + (ai.lastError || error));
+    alert("AI Error\n\nGemini failed: " + (ai.lastError || error));
     return false;
   }
 
@@ -101,10 +95,7 @@ let f = () => {
     const jsonText = extractJson(raw);
     data = JSON.parse(jsonText);
   } catch (error) {
-    app.displayAlert(
-      "Parse Error",
-      "Gemini returned something that wasn't valid JSON.\n\nResponse was:\n" + raw
-    );
+    alert("Parse Error\n\nGemini returned something that wasn't valid JSON.\n\nResponse was:\n" + raw);
     return false;
   }
 
@@ -115,10 +106,7 @@ let f = () => {
   const longDesc = stripTrailingPeriod(data.longDescription).replace(/[{}]/g, "");
 
   if (!slug || !title || !shortDesc || !longDesc) {
-    app.displayAlert(
-      "Missing Fields",
-      "Gemini did not return all required fields. Got:\n" + JSON.stringify(data, null, 2)
-    );
+    alert("Missing Fields\n\nGemini did not return all required fields. Got:\n" + JSON.stringify(data, null, 2));
     return false;
   }
 
@@ -139,8 +127,8 @@ let f = () => {
   let newDraft = new Draft();
   newDraft.content = output;
   newDraft.update();
-
   editor.load(newDraft);
+
   return true;
 };
 
